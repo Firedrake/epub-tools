@@ -1,0 +1,134 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+
+use experimental 'signatures';
+
+use Archive::Zip qw(:CONSTANTS);
+use XML::LibXML;
+use Getopt::Std;
+
+my %o;
+getopts('a:t:s:i:I:', \%o);
+
+my @a;
+my @as;
+if ($o{a}) {
+  foreach my $author (split /,\s*/,$o{a}) {
+    push @a,$author;
+    if ($author =~ /^(.+?)\s*\/\s*(.+?)$/) {
+      push @as,"$2, $1";
+    } elsif ($author =~ /^(.*) (\S*)$/) {
+      push @as,"$2, $1";
+    } else {
+      push @as,'';
+    }
+  }
+}
+
+my $fieldre='^(dc:(title|creator)|calibre:.*)$';
+
+foreach my $epubfile (@ARGV) {
+  my $dirty = 0;
+  my $zip = Archive::Zip->new($epubfile);
+  unless (defined $zip) {
+    warn "bad zip $epubfile\n";
+    return;
+  }
+  my $opf;
+  my @o=$zip->membersMatching('container\.xml');
+  if (@o) {
+    my $cx = $zip->contents($o[0]);
+    $cx =~ s/xmlns\s*=\s*"[^"]*"//gi;
+    my $c = XML::LibXML->load_xml(string => $cx);
+    foreach my $rootfile ($c->findnodes('/container/rootfiles/rootfile')) {
+      if ($rootfile->getAttribute('media-type') eq 'application/oebps-package+xml') {
+        $opf = $rootfile->getAttribute('full-path');
+      }
+    }
+  } else {
+    warn "$epubfile no container.xml\n";
+    my @opf = $zip->membersMatching('.*\.opf');
+    if (@opf) {
+      $opf = $opf[0];
+    } else {
+      warn "no opf either\n";
+      next;
+    }
+  }
+  my $o = XML::LibXML->load_xml(string => '' . $zip->contents($opf));
+  my $xpc = XML::LibXML::XPathContext->new($o);
+  $xpc->registerNs('x','http://www.idpf.org/2007/opf');
+  $xpc->registerNs('dc','http://purl.org/dc/elements/1.1/');
+  $xpc->registerNs('calibre','http://calibre.kovidgoyal.net/2009/metadata');
+  my $pa;
+  foreach my $meta ($xpc->findnodes('/x:package/x:metadata')) {
+    $pa ||= $meta;
+  }
+  if ($o{a}) {
+    $dirty = 1;
+    foreach my $node ($pa->findnodes('//dc:creator')) {
+      $node->unbindNode();
+    }
+    foreach my $i (0..$#a) {
+      my $ae = XML::LibXML::Element->new('dc:creator');
+      if ($as[$i]) {
+        $ae->setAttribute('opf:file-as',$as[$i]);
+      }
+      $ae->appendText($a[$i]);
+      $pa->appendChild($ae);
+    }
+  }
+  if ($o{t}) {
+    $dirty = 1;
+    foreach my $node ($pa->findnodes('//dc:title')) {
+      $node->unbindNode();
+    }
+    my $ae = XML::LibXML::Element->new('dc:title');
+    $ae->appendText($o{t});
+    $pa->appendChild($ae);
+    if ($o{t} =~ /^(A|An|The)\s+(.*)$/) {
+      $o{mt} = "$2, $1";
+    }
+    if ($o{mt}) {
+      foreach my $node ($pa->findnodes('//meta[@name="calibre:title_sort"]')) {
+        $pa ||= $node->parentNode();
+        $node->unbindNode();
+      }
+      my $ce = XML::LibXML::Element->new('meta');
+      $ce->setAttribute(name => 'calibre:title_sort');
+      $ce->setAttribute(content => $o{mt});
+      $pa->appendChild($ce);
+    }
+  }
+  if ($o{s}) {
+    foreach my $node ($pa->findnodes('//meta[@name="calibre:series"]')) {
+      $node->unbindNode();
+    }
+    $dirty = 1;
+    my $ce = XML::LibXML::Element->new('meta');
+    $ce->setAttribute(name => 'calibre:series');
+    $ce->setAttribute(content => $o{s});
+    $pa->appendChild($ce);
+  }
+  if ($o{i} || $o{I}) {
+    my $ix = $o{i} || $o{I}++;
+    foreach my $node ($xpc->findnodes('//meta[@name="calibre:series_index"]')) {
+      $node->unbindNode();
+    }
+    $dirty = 1;
+    my $ce = XML::LibXML::Element->new('meta');
+    $ce->setAttribute(name => 'calibre:series_index');
+    $ce->setAttribute(content => $ix);
+    $pa->appendChild($ce);
+  }
+  if ($dirty) {
+    my $opfnew = Archive::Zip::Member->newFromString($o->toString(),
+                                                     $opf);
+    $opfnew->desiredCompressionMethod('COMPRESSION_DEFLATED');
+    $opfnew->desiredCompressionLevel(9);
+    $zip->replaceMember($opf, $opfnew);
+    $zip->overwrite;
+  }
+}
